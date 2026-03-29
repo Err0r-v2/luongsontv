@@ -27,7 +27,7 @@ let currentFilter = 'ALL';
 let searchQuery   = '';
 let searchOpen    = false;
 let refreshTimer  = null;
-let hls           = null;
+let flvPlayer     = null;
 let routeToken    = 0;
 let bufferTimer   = null;
 
@@ -110,12 +110,13 @@ function esc(s) {
 
 /* ── Player ────────────────────────────────────────────── */
 function destroyPlayer() {
-  if (hls) { hls.destroy(); hls = null; }
+  if (flvPlayer) { flvPlayer.destroy(); flvPlayer = null; }
   clearTimeout(bufferTimer);
 }
 
-let retryUrl = null;
-function retryStream() { if (retryUrl) startStream(retryUrl); }
+let retryUrl    = null;
+let retryUrlFlv = null;
+function retryStream() { if (retryUrl) startStream(retryUrl, retryUrlFlv); }
 
 function restoreCrop() {
   const matchId = getRoute().id;
@@ -124,14 +125,18 @@ function restoreCrop() {
   if (!saved) return;
   try {
     const { sx, sy, sw, sh } = JSON.parse(saved);
-    applyCrop(sx, sy, sw, sh);
+    const wrap = document.getElementById('player-wrap');
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    applyCrop(sx * rect.width, sy * rect.height, sw * rect.width, sh * rect.height);
     const cropBtn = document.getElementById('ctrl-crop');
     if (cropBtn) cropBtn.classList.add('active');
   } catch (e) {}
 }
 
-function startStream(url) {
-  retryUrl = url;
+function startStream(url, flvUrl) {
+  retryUrl    = url;
+  retryUrlFlv = flvUrl || url;
   const video   = document.getElementById('nx-video');
   const overlay = document.getElementById('player-overlay');
   if (!video) return;
@@ -146,7 +151,6 @@ function startStream(url) {
     clearTimeout(bufferTimer);
   });
 
-  // Debounced loading: only show after 2.5s of continuous buffering
   video.addEventListener('waiting', () => {
     clearTimeout(bufferTimer);
     bufferTimer = setTimeout(() => {
@@ -170,30 +174,25 @@ function startStream(url) {
   }, 15000);
   video.addEventListener('playing', () => clearTimeout(loadTimeout), { once: true });
 
-  if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-    hls = new Hls({
-      maxBufferLength: 30, enableWorker: true,
-      liveSyncDurationCount: 6, liveMaxLatencyDurationCount: 20,
-      maxLiveSyncPlaybackRate: 1.05, backBufferLength: 0
-    });
-    hls.loadSource(url);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => {
-      video.muted = true;
-      video.play().then(() => { video.muted = false; }).catch(() => {});
-      restoreCrop();
-    });
-    hls.on(Hls.Events.ERROR, (_, d) => {
-      if (!d.fatal) return;
-      if (d.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-      else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-      else { hls.destroy(); hls = null; }
-    });
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = url;
-    video.muted = true;
-    video.play().then(() => { video.muted = false; }).catch(() => {});
-  }
+  flvPlayer = mpegts.createPlayer({ type: 'flv', url: flvUrl, isLive: true }, {
+    enableWorker: true,
+    liveBufferLatencyChasing: true,
+    liveBufferLatencyMaxLatency: 8,
+    liveBufferLatencyMinRemain: 2,
+    lazyLoad: false,
+  });
+  flvPlayer.attachMediaElement(video);
+  flvPlayer.load();
+  video.muted = true;
+  video.play().then(() => { video.muted = false; }).catch(() => {});
+  flvPlayer.on(mpegts.Events.ERROR, () => {
+    if (overlay) overlay.innerHTML = `<div class="player-overlay-msg">
+      <div style="color:var(--red);font-weight:700">Flux indisponible</div>
+      <div style="font-size:12px">Le stream n'a pas démarré</div>
+      <button class="retry-btn" onclick="retryStream()">Réessayer</button>
+    </div>`;
+  });
+  restoreCrop();
 }
 
 /* ── Crop system ───────────────────────────────────────── */
@@ -331,16 +330,21 @@ function applyCrop(px, py, pw, ph) {
   crop.sx = px; crop.sy = py; crop.sw = pw; crop.sh = ph;
   crop.mode = 'cropped';
 
-  // Persist crop to localStorage
-  const matchId = getRoute().id;
-  if (matchId) {
-    localStorage.setItem('crop_' + matchId, JSON.stringify({ sx: px, sy: py, sw: pw, sh: ph }));
-  }
-
   // Create canvas
   const canvas = document.createElement('canvas');
   canvas.className = 'crop-canvas';
   const wrapRect = wrap.getBoundingClientRect();
+
+  // Persist as normalized coords (0–1) so restore works at any player size
+  const matchId = getRoute().id;
+  if (matchId) {
+    localStorage.setItem('crop_' + matchId, JSON.stringify({
+      sx: px / wrapRect.width,
+      sy: py / wrapRect.height,
+      sw: pw / wrapRect.width,
+      sh: ph / wrapRect.height
+    }));
+  }
   const dpr = window.devicePixelRatio || 1;
   canvas.width = Math.round(wrapRect.width * dpr);
   canvas.height = Math.round(wrapRect.height * dpr);
@@ -404,13 +408,8 @@ function applyCrop(px, py, pw, ph) {
     const srcW = cropDispW / dispW * vw;
     const srcH = cropDispH / dispH * vh;
 
-    // Draw centered, same display scale (NO zoom)
-    const drawW = cropDispW;
-    const drawH = cropDispH;
-    const drawX = (playerW - drawW) / 2;
-    const drawY = (playerH - drawH) / 2;
-
-    ctx.drawImage(video, srcX, srcY, srcW, srcH, drawX, drawY, drawW, drawH);
+    // Scale crop to fill the canvas
+    ctx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, playerW, playerH);
 
     crop.animFrame = requestAnimationFrame(render);
   }
@@ -441,8 +440,10 @@ function bindPlayerControls(isLive) {
   // Sync to live
   if (syncBtn) {
     syncBtn.addEventListener('click', () => {
-      if (hls?.liveSyncPosition) video.currentTime = hls.liveSyncPosition;
-      else if (video.seekable?.length) video.currentTime = video.seekable.end(video.seekable.length - 1);
+      if (video.seekable?.length) {
+        const target = video.seekable.end(video.seekable.length - 1) - 3;
+        video.currentTime = Math.max(target, video.seekable.start(0));
+      }
       video.playbackRate = 1;
       video.play().catch(() => {});
     });
@@ -483,13 +484,17 @@ function bindPlayerControls(isLive) {
 
   // Auto-hide controls
   let hideTimer;
-  wrap.addEventListener('mousemove', () => {
+  const showControls = () => {
     clearTimeout(hideTimer);
     wrap.classList.add('show-controls');
-    hideTimer = setTimeout(() => {
-      if (!video.paused) wrap.classList.remove('show-controls');
-    }, 3000);
+    hideTimer = setTimeout(() => wrap.classList.remove('show-controls'), 3000);
+  };
+  wrap.addEventListener('mousemove', showControls);
+  wrap.addEventListener('mouseleave', () => {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => wrap.classList.remove('show-controls'), 300);
   });
+  wrap.addEventListener('mouseenter', showControls);
 }
 
 /* ── Navbar ─────────────────────────────────────────────── */
@@ -830,7 +835,7 @@ function buildMatchUI(m, page) {
   bindPlayerControls(isLive);
   bindCommentatorSwitch();
 
-  if (m.linkLive) startStream(m.linkLive);
+  if (m.linkLive) startStream(m.linkLive, m.linkLiveFlv);
   else {
     const ov = document.getElementById('player-overlay');
     if (ov) ov.innerHTML = '<div class="player-overlay-msg"><div style="color:var(--red);font-weight:700">Flux non disponible</div></div>';
@@ -848,6 +853,6 @@ function bindCommentatorSwitch() {
     const ov = document.getElementById('player-overlay');
     if (ov) { ov.style.display = ''; ov.innerHTML = '<div class="spinner"></div>'; }
     const d = await apiPost(`${API}/match-detail?matchId=${encodeURIComponent(btn.dataset.matchId)}`);
-    if (d?.value?.datas?.linkLive) startStream(d.value.datas.linkLive);
+    if (d?.value?.datas?.linkLive) startStream(d.value.datas.linkLive, d.value.datas.linkLiveFlv);
   });
 }
